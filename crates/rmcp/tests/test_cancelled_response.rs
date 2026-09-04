@@ -5,6 +5,18 @@
 
 use std::{collections::BTreeSet, process::Stdio, time::Duration};
 
+#[cfg(all(feature = "client", not(feature = "local")))]
+use rmcp::{
+    ClientHandler, RoleClient,
+    model::{
+        CancelledNotification, CancelledNotificationParam, ClientJsonRpcMessage, ClientRequest,
+        ClientResult, ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction,
+        ElicitationSchema, PingRequest, RequestId, ServerJsonRpcMessage, ServerNotification,
+        ServerRequest, ServerResult,
+    },
+    service::serve_directly,
+    transport::{IntoTransport, Transport},
+};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -21,6 +33,7 @@ use tokio::{
 
 const HELPER_ENV: &str = "RMCP_CANCELLED_RESPONSE_HELPER";
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const COMPUTER_USE_REQUEST_ID: &str = "computer-use-request-2";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_request_receives_no_response() -> anyhow::Result<()> {
@@ -43,7 +56,7 @@ async fn cancelled_request_receives_no_response() -> anyhow::Result<()> {
         }),
     )
     .await?;
-    collect_ids_until(&mut reader, 1, READ_TIMEOUT).await?;
+    collect_ids_until(&mut reader, "1", READ_TIMEOUT).await?;
     send_json(
         &mut writer,
         &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
@@ -56,7 +69,7 @@ async fn cancelled_request_receives_no_response() -> anyhow::Result<()> {
         &mut writer,
         &json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": COMPUTER_USE_REQUEST_ID,
             "method": "tools/call",
             "params": { "name": "wait-for-cancel", "arguments": {} }
         }),
@@ -67,21 +80,30 @@ async fn cancelled_request_receives_no_response() -> anyhow::Result<()> {
         &json!({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
-            "params": { "requestId": 2 }
+            "params": { "requestId": "unrelated-request" }
+        }),
+    )
+    .await?;
+    send_json(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": COMPUTER_USE_REQUEST_ID }
         }),
     )
     .await?;
     // A ping proves the server is alive past the cancellation, so the absence of
-    // an id=2 response is genuine suppression rather than a dead connection.
+    // a cancelled response is genuine suppression rather than a dead connection.
     send_json(
         &mut writer,
         &json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }),
     )
     .await?;
 
-    let seen = collect_ids_until(&mut reader, 3, READ_TIMEOUT).await?;
-    assert!(seen.contains(&3));
-    assert!(!seen.contains(&2));
+    let seen = collect_ids_until(&mut reader, "3", READ_TIMEOUT).await?;
+    assert!(seen.contains("3"));
+    assert!(!seen.contains(COMPUTER_USE_REQUEST_ID));
 
     drop(writer);
     wait_for_child(&mut child).await;
@@ -103,6 +125,146 @@ impl ServerHandler for WaitForCancelServer {
         context.ct.cancelled().await;
         Ok(CallToolResult::success(vec![ContentBlock::text("late response")]).into())
     }
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+#[derive(Clone)]
+struct WaitForReverseCancelClient {
+    events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+impl ClientHandler for WaitForReverseCancelClient {
+    async fn create_elicitation(
+        &self,
+        _request: ElicitRequestParams,
+        context: rmcp::service::RequestContext<RoleClient>,
+    ) -> Result<ElicitResult, McpError> {
+        self.events.send("started").expect("test is listening");
+        context.ct.cancelled().await;
+        self.events.send("cancelled").expect("test is listening");
+        Ok(ElicitResult::new(ElicitationAction::Decline))
+    }
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+#[tokio::test]
+async fn peer_cancels_reverse_request_without_cancelling_outbound_request() -> anyhow::Result<()> {
+    const REVERSE_REQUEST_ID: &str = "computer-use-elicitation-1";
+    const AFTER_CANCEL_ID: &str = "after-cancel";
+
+    let (client_transport, server_transport) = tokio::io::duplex(4096);
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = serve_directly::<RoleClient, _, _, _, _>(
+        WaitForReverseCancelClient { events: events_tx },
+        client_transport,
+        None,
+    );
+    let mut server = IntoTransport::<RoleServer, _, _>::into_transport(server_transport);
+
+    let outbound = tokio::spawn({
+        let peer = client.peer().clone();
+        async move {
+            peer.send_request(ClientRequest::PingRequest(PingRequest {
+                method: Default::default(),
+                extensions: Default::default(),
+            }))
+            .await
+        }
+    });
+    let Some(ClientJsonRpcMessage::Request(outbound_request)) = server.receive().await else {
+        panic!("expected outbound ping request");
+    };
+
+    server
+        .send(ServerJsonRpcMessage::request(
+            ServerRequest::ElicitRequest(ElicitRequest::new(
+                ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: "Continue using computer control?".to_owned(),
+                    requested_schema: ElicitationSchema::builder()
+                        .build()
+                        .expect("empty elicitation schema is valid"),
+                },
+            )),
+            RequestId::String(REVERSE_REQUEST_ID.into()),
+        ))
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(READ_TIMEOUT, events_rx.recv()).await?,
+        Some("started")
+    );
+
+    server
+        .send(ServerJsonRpcMessage::notification(
+            ServerNotification::CancelledNotification(CancelledNotification::new(
+                CancelledNotificationParam::new(
+                    Some(outbound_request.id.clone()),
+                    Some("unrelated direction".to_owned()),
+                ),
+            )),
+        ))
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events_rx.recv())
+            .await
+            .is_err(),
+        "unrelated cancellation must not cancel the reverse request"
+    );
+    assert!(
+        !outbound.is_finished(),
+        "peer cancellation must not cancel an outbound request with the same ID"
+    );
+
+    server
+        .send(ServerJsonRpcMessage::response(
+            ServerResult::empty(()),
+            outbound_request.id,
+        ))
+        .await?;
+    assert!(matches!(outbound.await??, ServerResult::EmptyResult(_)));
+
+    server
+        .send(ServerJsonRpcMessage::notification(
+            ServerNotification::CancelledNotification(CancelledNotification::new(
+                CancelledNotificationParam::new(
+                    Some(RequestId::String(REVERSE_REQUEST_ID.into())),
+                    Some("user cancelled".to_owned()),
+                ),
+            )),
+        ))
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(READ_TIMEOUT, events_rx.recv()).await?,
+        Some("cancelled"),
+        "the matching cancellation must fire RequestContext.ct"
+    );
+
+    server
+        .send(ServerJsonRpcMessage::request(
+            ServerRequest::PingRequest(PingRequest {
+                method: Default::default(),
+                extensions: Default::default(),
+            }),
+            RequestId::String(AFTER_CANCEL_ID.into()),
+        ))
+        .await?;
+    let Some(ClientJsonRpcMessage::Response(response)) =
+        tokio::time::timeout(READ_TIMEOUT, server.receive()).await?
+    else {
+        panic!("expected ping response after cancellation");
+    };
+    assert_eq!(response.id, RequestId::String(AFTER_CANCEL_ID.into()));
+    assert!(matches!(response.result, ClientResult::EmptyResult(_)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.receive())
+            .await
+            .is_err(),
+        "cancelled reverse request must not send a late response"
+    );
+
+    client.cancel().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -172,9 +334,9 @@ where
 /// (then a short grace read to catch any straggler) or the timeout elapses.
 async fn collect_ids_until<R>(
     reader: &mut BufReader<R>,
-    stop_id: u64,
+    stop_id: &str,
     timeout: Duration,
-) -> anyhow::Result<BTreeSet<u64>>
+) -> anyhow::Result<BTreeSet<String>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -200,8 +362,13 @@ where
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if let Some(id) = value.get("id").and_then(Value::as_u64) {
-            seen.insert(id);
+        let id = match value.get("id") {
+            Some(Value::String(id)) => Some(id.clone()),
+            Some(Value::Number(id)) => Some(id.to_string()),
+            _ => None,
+        };
+        if let Some(id) = id {
+            seen.insert(id.clone());
             if id == stop_id {
                 // Give any late (incorrectly-sent) response a brief window to arrive.
                 deadline = tokio::time::Instant::now() + Duration::from_millis(300);

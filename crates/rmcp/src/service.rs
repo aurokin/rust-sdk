@@ -1604,19 +1604,12 @@ where
                     let cancellation_request_id =
                         if let Some(cancelled) = R::peer_cancelled_params(&notification) {
                             let request_id = cancelled.request_id.clone();
-                            if let Some(request_id) = request_id.as_ref() {
-                                if R::IS_CLIENT {
-                                    if let Some(responder) =
-                                        local_responder_pool.remove(request_id)
-                                    {
-                                        let _ = responder.send(Err(ServiceError::Cancelled {
-                                            reason: cancelled.reason.clone(),
-                                        }));
-                                    }
-                                } else if let Some(ct) = local_ct_pool.remove(request_id) {
-                                    tracing::info!(id = %request_id, reason = cancelled.reason, "cancelled");
-                                    ct.cancel();
-                                }
+                            if let Some(request_id) = request_id.as_ref()
+                                && let Some(ct) =
+                                    remove_pending_request(&mut local_ct_pool, request_id)
+                            {
+                                tracing::info!(id = %request_id, reason = cancelled.reason, "cancelled");
+                                ct.cancel();
                             }
                             request_id
                         } else {
