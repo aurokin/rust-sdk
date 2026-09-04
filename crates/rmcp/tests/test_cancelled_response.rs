@@ -3,6 +3,10 @@
 //! until the request is cancelled, so its result is only produced *after* the
 //! cancellation — the service loop must drop it rather than write it to the wire.
 
+#[cfg(all(feature = "client", not(feature = "local")))]
+use std::sync::Arc;
+#[cfg(all(feature = "client", not(feature = "local")))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::BTreeSet, process::Stdio, time::Duration};
 
 #[cfg(all(feature = "client", not(feature = "local")))]
@@ -14,7 +18,7 @@ use rmcp::{
         ElicitationSchema, PingRequest, RequestId, ServerJsonRpcMessage, ServerNotification,
         ServerRequest, ServerResult,
     },
-    service::serve_directly,
+    service::{QuitReason, serve_directly},
     transport::{IntoTransport, Transport},
 };
 use rmcp::{
@@ -105,6 +109,35 @@ async fn cancelled_request_receives_no_response() -> anyhow::Result<()> {
     assert!(seen.contains("3"));
     assert!(!seen.contains(COMPUTER_USE_REQUEST_ID));
 
+    send_json(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "complete-unless-cancelled", "arguments": {} }
+        }),
+    )
+    .await?;
+    send_json(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": "4" }
+        }),
+    )
+    .await?;
+    send_json(
+        &mut writer,
+        &json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }),
+    )
+    .await?;
+
+    let seen = collect_ids_until(&mut reader, "5", READ_TIMEOUT).await?;
+    assert!(seen.contains("4"), "string and numeric IDs must not alias");
+    assert!(seen.contains("5"));
+
     drop(writer);
     wait_for_child(&mut child).await;
     Ok(())
@@ -119,9 +152,16 @@ impl ServerHandler for WaitForCancelServer {
 
     async fn call_tool(
         &self,
-        _request: CallToolRequestParams,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        if request.name == "complete-unless-cancelled" {
+            tokio::select! {
+                _ = context.ct.cancelled() => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            return Ok(CallToolResult::success(vec![ContentBlock::text("completed")]).into());
+        }
         context.ct.cancelled().await;
         Ok(CallToolResult::success(vec![ContentBlock::text("late response")]).into())
     }
@@ -131,6 +171,7 @@ impl ServerHandler for WaitForCancelServer {
 #[derive(Clone)]
 struct WaitForReverseCancelClient {
     events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    finish: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(all(feature = "client", not(feature = "local")))]
@@ -143,6 +184,9 @@ impl ClientHandler for WaitForReverseCancelClient {
         self.events.send("started").expect("test is listening");
         context.ct.cancelled().await;
         self.events.send("cancelled").expect("test is listening");
+        if let Some(finish) = &self.finish {
+            finish.notified().await;
+        }
         Ok(ElicitResult::new(ElicitationAction::Decline))
     }
 }
@@ -156,7 +200,10 @@ async fn peer_cancels_reverse_request_without_cancelling_outbound_request() -> a
     let (client_transport, server_transport) = tokio::io::duplex(4096);
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let client = serve_directly::<RoleClient, _, _, _, _>(
-        WaitForReverseCancelClient { events: events_tx },
+        WaitForReverseCancelClient {
+            events: events_tx,
+            finish: None,
+        },
         client_transport,
         None,
     );
@@ -264,6 +311,285 @@ async fn peer_cancels_reverse_request_without_cancelling_outbound_request() -> a
     );
 
     client.cancel().await?;
+    Ok(())
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+struct ChannelClientTransport {
+    incoming: tokio::sync::mpsc::UnboundedReceiver<ServerJsonRpcMessage>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<ClientJsonRpcMessage>,
+    eof_observed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+impl Transport<RoleClient> for ChannelClientTransport {
+    type Error = std::io::Error;
+
+    fn send(
+        &mut self,
+        item: ClientJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let outgoing = self.outgoing.clone();
+        async move {
+            outgoing.send(item).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "test receiver closed")
+            })
+        }
+    }
+
+    async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
+        let message = self.incoming.recv().await;
+        if message.is_none() {
+            self.eof_observed.notify_one();
+        }
+        message
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+#[derive(Clone)]
+struct ReusedIdClient {
+    calls: Arc<AtomicUsize>,
+    events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    first_finish: Arc<tokio::sync::Notify>,
+    second_finish: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+impl ClientHandler for ReusedIdClient {
+    async fn create_elicitation(
+        &self,
+        _request: ElicitRequestParams,
+        context: rmcp::service::RequestContext<RoleClient>,
+    ) -> Result<ElicitResult, McpError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                self.events
+                    .send("first-started")
+                    .expect("test is listening");
+                context.ct.cancelled().await;
+                self.events
+                    .send("first-cancelled")
+                    .expect("test is listening");
+                self.first_finish.notified().await;
+                Ok(ElicitResult::new(ElicitationAction::Decline))
+            }
+            1 => {
+                self.events
+                    .send("second-started")
+                    .expect("test is listening");
+                self.second_finish.notified().await;
+                Ok(ElicitResult::new(ElicitationAction::Accept))
+            }
+            call => panic!("unexpected elicitation call {call}"),
+        }
+    }
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+fn reverse_elicitation(id: &str) -> ServerJsonRpcMessage {
+    ServerJsonRpcMessage::request(
+        ServerRequest::ElicitRequest(ElicitRequest::new(
+            ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message: "Continue using computer control?".to_owned(),
+                requested_schema: ElicitationSchema::builder()
+                    .build()
+                    .expect("empty elicitation schema is valid"),
+            },
+        )),
+        RequestId::String(id.into()),
+    )
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+#[tokio::test]
+async fn cancelled_response_cannot_consume_reused_request_id() -> anyhow::Result<()> {
+    const REUSED_REQUEST_ID: &str = "computer-use-reused-id";
+    const AFTER_REUSE_ID: &str = "after-reuse";
+
+    let (to_client, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (outgoing, mut from_client) = tokio::sync::mpsc::unbounded_channel();
+    let eof_observed = Arc::new(tokio::sync::Notify::new());
+    let first_finish = Arc::new(tokio::sync::Notify::new());
+    let second_finish = Arc::new(tokio::sync::Notify::new());
+    let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = serve_directly::<RoleClient, _, _, _, _>(
+        ReusedIdClient {
+            calls: Arc::new(AtomicUsize::new(0)),
+            events,
+            first_finish: first_finish.clone(),
+            second_finish: second_finish.clone(),
+        },
+        ChannelClientTransport {
+            incoming,
+            outgoing,
+            eof_observed,
+        },
+        None,
+    );
+
+    to_client.send(reverse_elicitation(REUSED_REQUEST_ID))?;
+    assert_eq!(event_rx.recv().await, Some("first-started"));
+    to_client.send(ServerJsonRpcMessage::notification(
+        ServerNotification::CancelledNotification(CancelledNotification::new(
+            CancelledNotificationParam::new(
+                Some(RequestId::String(REUSED_REQUEST_ID.into())),
+                Some("user cancelled".to_owned()),
+            ),
+        )),
+    ))?;
+    assert_eq!(event_rx.recv().await, Some("first-cancelled"));
+
+    to_client.send(reverse_elicitation(REUSED_REQUEST_ID))?;
+    assert_eq!(event_rx.recv().await, Some("second-started"));
+    first_finish.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), from_client.recv())
+            .await
+            .is_err(),
+        "the cancelled handler's stale response must remain suppressed"
+    );
+
+    second_finish.notify_one();
+    let Some(ClientJsonRpcMessage::Response(response)) =
+        tokio::time::timeout(READ_TIMEOUT, from_client.recv()).await?
+    else {
+        panic!("expected response from the replacement request");
+    };
+    assert_eq!(response.id, RequestId::String(REUSED_REQUEST_ID.into()));
+    let ClientResult::ElicitResult(result) = response.result else {
+        panic!("expected elicitation response");
+    };
+    assert_eq!(result.action, ElicitationAction::Accept);
+
+    to_client.send(ServerJsonRpcMessage::request(
+        ServerRequest::PingRequest(PingRequest {
+            method: Default::default(),
+            extensions: Default::default(),
+        }),
+        RequestId::String(AFTER_REUSE_ID.into()),
+    ))?;
+    let Some(ClientJsonRpcMessage::Response(response)) =
+        tokio::time::timeout(READ_TIMEOUT, from_client.recv()).await?
+    else {
+        panic!("expected ping response after ID reuse");
+    };
+    assert_eq!(response.id, RequestId::String(AFTER_REUSE_ID.into()));
+
+    drop(to_client);
+    assert!(matches!(
+        tokio::time::timeout(READ_TIMEOUT, client.waiting()).await??,
+        QuitReason::Closed
+    ));
+    Ok(())
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+#[tokio::test]
+async fn graceful_close_drains_uncancelled_reverse_response() -> anyhow::Result<()> {
+    const REVERSE_REQUEST_ID: &str = "computer-use-close-drain";
+
+    let (to_client, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (outgoing, mut from_client) = tokio::sync::mpsc::unbounded_channel();
+    let eof_observed = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut client = serve_directly::<RoleClient, _, _, _, _>(
+        WaitForReverseCancelClient {
+            events: events_tx,
+            finish: Some(finish.clone()),
+        },
+        ChannelClientTransport {
+            incoming,
+            outgoing,
+            eof_observed,
+        },
+        None,
+    );
+
+    to_client.send(reverse_elicitation(REVERSE_REQUEST_ID))?;
+    assert_eq!(events_rx.recv().await, Some("started"));
+
+    let (close_result, cancellation_event) = tokio::join!(client.close(), async {
+        let event = events_rx.recv().await;
+        finish.notify_one();
+        event
+    });
+    assert!(matches!(close_result?, QuitReason::Cancelled));
+    assert_eq!(cancellation_event, Some("cancelled"));
+
+    let Some(ClientJsonRpcMessage::Response(response)) =
+        tokio::time::timeout(READ_TIMEOUT, from_client.recv()).await?
+    else {
+        panic!("expected in-flight response during graceful close");
+    };
+    assert_eq!(response.id, RequestId::String(REVERSE_REQUEST_ID.into()));
+    Ok(())
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+#[tokio::test]
+async fn cancelled_reverse_request_stays_suppressed_during_eof_drain() -> anyhow::Result<()> {
+    const REVERSE_REQUEST_ID: &str = "computer-use-elicitation-before-eof";
+
+    let (to_client, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (outgoing, mut from_client) = tokio::sync::mpsc::unbounded_channel();
+    let eof_observed = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = serve_directly::<RoleClient, _, _, _, _>(
+        WaitForReverseCancelClient {
+            events: events_tx,
+            finish: Some(finish.clone()),
+        },
+        ChannelClientTransport {
+            incoming,
+            outgoing,
+            eof_observed: eof_observed.clone(),
+        },
+        None,
+    );
+
+    to_client.send(reverse_elicitation(REVERSE_REQUEST_ID))?;
+    assert_eq!(
+        tokio::time::timeout(READ_TIMEOUT, events_rx.recv()).await?,
+        Some("started")
+    );
+
+    to_client.send(ServerJsonRpcMessage::notification(
+        ServerNotification::CancelledNotification(CancelledNotification::new(
+            CancelledNotificationParam::new(
+                Some(RequestId::String(REVERSE_REQUEST_ID.into())),
+                Some("user cancelled".to_owned()),
+            ),
+        )),
+    ))?;
+    assert_eq!(
+        tokio::time::timeout(READ_TIMEOUT, events_rx.recv()).await?,
+        Some("cancelled")
+    );
+
+    let eof = eof_observed.notified();
+    drop(to_client);
+    tokio::time::timeout(READ_TIMEOUT, eof).await?;
+    finish.notify_one();
+
+    assert!(
+        matches!(
+            tokio::time::timeout(READ_TIMEOUT, client.waiting()).await??,
+            QuitReason::Closed
+        ),
+        "client must close after input EOF"
+    );
+    assert!(
+        from_client.recv().await.is_none(),
+        "cancelled reverse request must not be sent during EOF drain"
+    );
     Ok(())
 }
 

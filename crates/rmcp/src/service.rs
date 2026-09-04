@@ -276,6 +276,18 @@ pub type RxJsonRpcMessage<R> = JsonRpcMessage<
     <R as ServiceRole>::PeerNot,
 >;
 
+#[derive(Debug)]
+struct HandlerResponse<R: ServiceRole> {
+    message: TxJsonRpcMessage<R>,
+    peer_cancel_ct: CancellationToken,
+}
+
+#[derive(Debug)]
+struct PendingRequestCancellation {
+    handler_ct: CancellationToken,
+    peer_cancel_ct: CancellationToken,
+}
+
 #[cfg(not(feature = "local"))]
 pub trait Service<R: ServiceRole>: Send + Sync + 'static {
     fn handle_request(
@@ -1339,7 +1351,7 @@ where
 {
     const SINK_PROXY_BUFFER_SIZE: usize = 64;
     let (sink_proxy_tx, mut sink_proxy_rx) =
-        tokio::sync::mpsc::channel::<TxJsonRpcMessage<R>>(SINK_PROXY_BUFFER_SIZE);
+        tokio::sync::mpsc::channel::<HandlerResponse<R>>(SINK_PROXY_BUFFER_SIZE);
     let peer_info = peer.peer_info();
     if R::IS_CLIENT {
         tracing::info!(?peer_info, "Service initialized as client");
@@ -1349,7 +1361,7 @@ where
 
     let mut local_responder_pool =
         HashMap::<RequestId, Responder<Result<R::PeerResp, ServiceError>>>::new();
-    let mut local_ct_pool = HashMap::<RequestId, CancellationToken>::new();
+    let mut local_ct_pool = HashMap::<RequestId, PendingRequestCancellation>::new();
     let shared_service = Arc::new(service);
     // for return
     let service = shared_service.clone();
@@ -1380,7 +1392,7 @@ where
         enum Event<R: ServiceRole> {
             ProxyMessage(PeerSinkMessage<R>),
             PeerMessage(RxJsonRpcMessage<R>),
-            ToSink(TxJsonRpcMessage<R>),
+            ToSink(HandlerResponse<R>),
             SendTaskResult(SendTaskResult),
             ResponseSendTaskResult(Result<(), tokio::task::JoinError>),
         }
@@ -1474,18 +1486,25 @@ where
                     }
                 }
                 // response and error
-                Event::ToSink(m) => {
-                    if let Some(id) = match &m {
+                Event::ToSink(HandlerResponse {
+                    message,
+                    peer_cancel_ct,
+                }) => {
+                    if peer_cancel_ct.is_cancelled() {
+                        tracing::debug!("dropping response for cancelled request");
+                        continue;
+                    }
+                    if let Some(id) = match &message {
                         JsonRpcMessage::Response(response) => Some(&response.id),
                         JsonRpcMessage::Error(error) => error.id.as_ref(),
                         _ => None,
                     } {
-                        let Some(ct) = local_ct_pool.remove(id) else {
+                        let Some(cancellation) = local_ct_pool.remove(id) else {
                             tracing::debug!(%id, "dropping response for cancelled request");
                             continue;
                         };
-                        ct.cancel();
-                        let send = transport.send(m);
+                        cancellation.handler_ct.cancel();
+                        let send = transport.send(message);
                         let current_span = tracing::Span::current();
                         response_send_tasks.spawn(async move {
                             let send_result = send.await;
@@ -1561,7 +1580,14 @@ where
                         let sink = sink_proxy_tx.clone();
                         let request_ct = serve_loop_ct.child_token();
                         let context_ct = request_ct.child_token();
-                        local_ct_pool.insert(id.clone(), request_ct);
+                        let peer_cancel_ct = CancellationToken::new();
+                        local_ct_pool.insert(
+                            id.clone(),
+                            PendingRequestCancellation {
+                                handler_ct: request_ct,
+                                peer_cancel_ct: peer_cancel_ct.clone(),
+                            },
+                        );
                         let mut extensions = Extensions::new();
                         let mut meta = RequestMetaObject::new();
                         // avoid clone
@@ -1591,7 +1617,12 @@ where
                                     JsonRpcMessage::error(error, Some(id))
                                 }
                             };
-                            let _send_result = sink.send(response).await;
+                            let _send_result = sink
+                                .send(HandlerResponse {
+                                    message: response,
+                                    peer_cancel_ct,
+                                })
+                                .await;
                         }.instrument(current_span));
                     }
                 }
@@ -1605,11 +1636,11 @@ where
                         if let Some(cancelled) = R::peer_cancelled_params(&notification) {
                             let request_id = cancelled.request_id.clone();
                             if let Some(request_id) = request_id.as_ref()
-                                && let Some(ct) =
-                                    remove_pending_request(&mut local_ct_pool, request_id)
+                                && let Some(cancellation) = local_ct_pool.remove(request_id)
                             {
                                 tracing::info!(id = %request_id, reason = cancelled.reason, "cancelled");
-                                ct.cancel();
+                                cancellation.peer_cancel_ct.cancel();
+                                cancellation.handler_ct.cancel();
                             }
                             request_id
                         } else {
@@ -1741,8 +1772,27 @@ where
                 }
                 // Then drain any handler responses still in the channel
                 // (handlers that finished after the loop broke).
-                while let Some(m) = sink_proxy_rx.recv().await {
-                    if let Err(error) = transport.send(m).await {
+                while let Some(HandlerResponse {
+                    message,
+                    peer_cancel_ct,
+                }) = sink_proxy_rx.recv().await
+                {
+                    if peer_cancel_ct.is_cancelled() {
+                        tracing::debug!("dropping response for cancelled request during drain");
+                        continue;
+                    }
+                    if let Some(id) = match &message {
+                        JsonRpcMessage::Response(response) => Some(&response.id),
+                        JsonRpcMessage::Error(error) => error.id.as_ref(),
+                        _ => None,
+                    } {
+                        let Some(cancellation) = local_ct_pool.remove(id) else {
+                            tracing::debug!(%id, "dropping response for cancelled request");
+                            continue;
+                        };
+                        cancellation.handler_ct.cancel();
+                    }
+                    if let Err(error) = transport.send(message).await {
                         tracing::error!(%error, "failed to send pending response during drain");
                         break;
                     }
