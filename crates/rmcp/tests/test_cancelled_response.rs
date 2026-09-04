@@ -170,6 +170,7 @@ impl ServerHandler for WaitForCancelServer {
 struct WaitForReverseCancelClient {
     events: tokio::sync::mpsc::UnboundedSender<&'static str>,
     finish: Option<Arc<tokio::sync::Notify>>,
+    return_error: bool,
 }
 
 #[cfg(all(feature = "client", not(feature = "local")))]
@@ -184,6 +185,9 @@ impl ClientHandler for WaitForReverseCancelClient {
         self.events.send("cancelled").expect("test is listening");
         if let Some(finish) = &self.finish {
             finish.notified().await;
+        }
+        if self.return_error {
+            return Err(McpError::internal_error("late handler error", None));
         }
         Ok(ElicitResult::new(ElicitationAction::Decline))
     }
@@ -208,6 +212,7 @@ async fn reverse_cancellation(startup: &str, equal_ids: bool) -> anyhow::Result<
     let handler = WaitForReverseCancelClient {
         events: events_tx,
         finish: None,
+        return_error: false,
     };
     let mut server = IntoTransport::<RoleServer, _, _>::into_transport(server_transport);
     let mut info = ServerInfo::default();
@@ -409,6 +414,7 @@ async fn graceful_close_drains_uncancelled_reverse_response() -> anyhow::Result<
         WaitForReverseCancelClient {
             events: events_tx,
             finish: Some(finish.clone()),
+            return_error: false,
         },
         ChannelClientTransport {
             incoming,
@@ -441,6 +447,18 @@ async fn graceful_close_drains_uncancelled_reverse_response() -> anyhow::Result<
 #[cfg(all(feature = "client", not(feature = "local")))]
 #[tokio::test]
 async fn cancelled_reverse_request_stays_suppressed_during_eof_drain() -> anyhow::Result<()> {
+    for return_error in [false, true] {
+        tokio::time::timeout(
+            READ_TIMEOUT,
+            cancelled_reverse_response_at_eof(return_error),
+        )
+        .await??;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "client", not(feature = "local")))]
+async fn cancelled_reverse_response_at_eof(return_error: bool) -> anyhow::Result<()> {
     const REVERSE_REQUEST_ID: &str = "elicitation-before-eof";
 
     let (to_client, incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -452,6 +470,7 @@ async fn cancelled_reverse_request_stays_suppressed_during_eof_drain() -> anyhow
         WaitForReverseCancelClient {
             events: events_tx,
             finish: Some(finish.clone()),
+            return_error,
         },
         ChannelClientTransport {
             incoming,
@@ -494,7 +513,7 @@ async fn cancelled_reverse_request_stays_suppressed_during_eof_drain() -> anyhow
     );
     assert!(
         from_client.recv().await.is_none(),
-        "cancelled reverse request must not be sent during EOF drain"
+        "cancelled reverse request must not be sent during EOF drain (return_error={return_error})"
     );
     Ok(())
 }
