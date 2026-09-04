@@ -292,8 +292,14 @@ impl ServiceRole for RoleClient {
         }
     }
 
-    fn peer_cancels_subscriptions(peer_info: Option<&Self::PeerInfo>) -> bool {
-        peer_info.is_some_and(|info| !super::is_legacy_version(&info.protocol_version))
+    fn peer_cancels_subscriptions(peer: &Peer<Self>) -> bool {
+        // Discovery keeps modern lifecycle semantics even with an older application version.
+        !super::uses_legacy_lifecycle(
+            peer.peer_info()
+                .as_deref()
+                .map(|info| &info.protocol_version),
+            peer.client_request_metadata.get().is_some(),
+        )
     }
 
     fn is_subscription_request(request: &Self::Req) -> bool {
@@ -2205,10 +2211,14 @@ mod tests {
     async fn server_cancellation_retires_subscription_responder() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                for discover in [false, true] {
+                for (discover, version) in [
+                    (false, ProtocolVersion::V_2026_07_28),
+                    (true, ProtocolVersion::V_2026_07_28),
+                    (true, ProtocolVersion::V_2025_11_25),
+                ] {
                     tokio::time::timeout(
                         Duration::from_secs(5),
-                        check_subscription_cancellation(discover),
+                        check_subscription_cancellation(discover, version),
                     )
                     .await
                     .expect("subscription cancellation timed out");
@@ -2217,7 +2227,7 @@ mod tests {
             .await;
     }
 
-    async fn check_subscription_cancellation(discover: bool) {
+    async fn check_subscription_cancellation(discover: bool, version: ProtocolVersion) {
         use crate::model::{
             GetMeta, PingRequest, ServerInfo, SubscriptionsAcknowledgedNotification,
             SubscriptionsAcknowledgedNotificationParams,
@@ -2227,7 +2237,7 @@ mod tests {
         let mut server =
             crate::transport::IntoTransport::<RoleServer, _, _>::into_transport(server_transport);
         let info = ServerInfo {
-            protocol_version: ProtocolVersion::V_2026_07_28,
+            protocol_version: version.clone(),
             ..Default::default()
         };
         let client = if discover {
@@ -2236,7 +2246,7 @@ mod tests {
                     (),
                     client_transport,
                     ClientLifecycleMode::Discover {
-                        preferred_versions: vec![ProtocolVersion::V_2026_07_28]
+                        preferred_versions: vec![version.clone()]
                     }
                 ),
                 async {
@@ -2248,7 +2258,7 @@ mod tests {
                     server
                         .send(ServerJsonRpcMessage::response(
                             ServerResult::DiscoverResult(DiscoverResult::new(
-                                vec![ProtocolVersion::V_2026_07_28],
+                                vec![version],
                                 info.capabilities,
                             )),
                             request.id,

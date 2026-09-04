@@ -137,7 +137,7 @@ pub trait ServiceRole: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
         None
     }
     #[doc(hidden)]
-    fn peer_cancels_subscriptions(_peer_info: Option<&Self::PeerInfo>) -> bool {
+    fn peer_cancels_subscriptions(_peer: &Peer<Self>) -> bool {
         false
     }
     #[doc(hidden)]
@@ -1621,7 +1621,7 @@ where
                             let request_id = cancelled.request_id.clone();
                             // Modern servers cancel listen requests; legacy peers cancel
                             // requests they originated, even when both directions share an ID.
-                            if R::peer_cancels_subscriptions(peer.peer_info().as_deref()) {
+                            if R::peer_cancels_subscriptions(&peer) {
                                 if let Some(request_id) = request_id.as_ref() {
                                     if local_responder_pool.get(request_id)
                                         .is_some_and(|pending| pending.is_subscription)
